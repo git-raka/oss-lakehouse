@@ -1,0 +1,165 @@
+name: oss-lakehouse
+
+# One image for every Python component: Spark + Delta, OCR, Dagster, API, simulators.
+x-pipeline: &pipeline
+  image: lakehouse/pipeline:0.1
+  restart: unless-stopped
+  env_file: .env
+  environment: &pipeline-env
+    S3_ENDPOINT: http://seaweedfs:8333
+    PG_DSN: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/erp
+    TRINO_HOST: trino
+    TRINO_PORT: "8080"
+    MQTT_HOST: mosquitto
+    SOURCES_DIR: /sources
+    TZ: Asia/Jakarta
+    # Recent S3 clients (boto3 / AWS SDK v2) add checksums by default; only send them when required
+    AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+    AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  volumes:
+    - ./src:/app/src:ro
+    - sources:/sources
+
+services:
+  # ---------- Storage ----------
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.51
+    restart: unless-stopped
+    env_file: .env
+    entrypoint: ["/bin/sh", "/etc/seaweedfs/start.sh"]
+    ports: ["127.0.0.1:8333:8333"]   # S3: internal only
+    volumes:
+      - seaweed:/data
+      - ./config/seaweedfs/start.sh:/etc/seaweedfs/start.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/healthz || exit 1"]
+      interval: 10s
+      retries: 12
+    mem_limit: 768m
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports: ["127.0.0.1:55433:5432"]
+    volumes:
+      - pg:/var/lib/postgresql/data
+      - ./config/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 20
+    mem_limit: 512m
+
+  # ---------- Ingestion ----------
+  mosquitto:
+    image: eclipse-mosquitto:2.0.22
+    restart: unless-stopped
+    ports: ["127.0.0.1:1883:1883"]   # anonymous MQTT -> local only (production: TLS + auth)
+    volumes:
+      - ./config/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    mem_limit: 64m
+
+  iot-simulator:
+    <<: *pipeline
+    command: python -m lakehouse.iot.simulator
+    depends_on: [mosquitto]
+    mem_limit: 192m
+
+  iot-collector:
+    <<: *pipeline
+    command: python -m lakehouse.iot.collector
+    depends_on: [mosquitto, seaweedfs]
+    mem_limit: 192m
+
+  # Source-data generator (ERP, tenants, PDFs, photos, weighbridge, ticketing). Run: make seed
+  seed:
+    <<: *pipeline
+    restart: "no"
+    command: python -m lakehouse.seed
+    profiles: ["jobs"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      seaweedfs: { condition: service_healthy }
+
+  # ---------- Processing & orchestration ----------
+  dagster:
+    <<: *pipeline
+    command: dagster dev -h 0.0.0.0 -p 3001 -m lakehouse.orchestration
+    environment:
+      <<: *pipeline-env
+      DAGSTER_HOME: /dagster_home
+      SPARK_DRIVER_MEMORY: 2g
+    volumes:
+      - ./src:/app/src:ro
+      - sources:/sources
+      - dagster_home:/dagster_home
+    ports: ["${BIND}:3001:3001"]
+    depends_on: [seaweedfs, postgres, trino]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:3001/server_info"]
+      interval: 15s
+      retries: 10
+    mem_limit: 4g
+
+  # ---------- SQL serving + governance ----------
+  trino:
+    image: trinodb/trino:484
+    restart: unless-stopped
+    env_file: .env
+    ports: ["127.0.0.1:8080:8080"]   # Trino without auth -> local only (production: OAuth2 + TLS)
+    volumes:
+      - ./config/trino/catalog/delta.properties:/etc/trino/catalog/delta.properties:ro
+      - ./config/trino/access-control.properties:/etc/trino/access-control.properties:ro
+      - ./config/trino/group-provider.properties:/etc/trino/group-provider.properties:ro
+      - ./config/trino/security:/etc/trino/security:ro   # directory mount -> policy changes reload without restart
+    depends_on: [seaweedfs]
+    mem_limit: 2560m
+
+  # ---------- Consumption ----------
+  superset:
+    image: lakehouse/superset:0.1
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVER_WORKER_AMOUNT: "2"
+    ports: ["${BIND}:8088:8088"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      trino: { condition: service_started }
+    mem_limit: 1536m
+
+  api:
+    <<: *pipeline
+    command: uvicorn lakehouse.api.main:app --host 0.0.0.0 --port 8000
+    ports: ["${BIND}:8000:8000"]
+    depends_on: [trino]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8000/health"]
+      interval: 15s
+      retries: 10
+    mem_limit: 256m
+
+  # Optional (saves RAM): make notebook
+  jupyter:
+    <<: *pipeline
+    command: >
+      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root
+      --ServerApp.token=${JUPYTER_TOKEN} --notebook-dir=/app/notebooks
+    environment:
+      <<: *pipeline-env
+      SPARK_DRIVER_MEMORY: 2g
+    volumes:
+      - ./src:/app/src:ro
+      - ./notebooks:/app/notebooks
+      - sources:/sources
+    ports: ["${BIND}:8888:8888"]
+    profiles: ["notebook"]
+    mem_limit: 3g
+
+volumes:
+  seaweed:
+  pg:
+  sources:
+  dagster_home:

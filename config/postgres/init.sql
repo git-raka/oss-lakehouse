@@ -1,0 +1,2 @@
+CREATE DATABASE erp;
+CREATE DATABASE superset;

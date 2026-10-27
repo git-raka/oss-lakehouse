@@ -1,0 +1,52 @@
+{
+  "catalogs": [
+    { "group": "admin", "catalog": ".*", "allow": "all" },
+    { "catalog": "(delta|system)", "allow": "read-only" }
+  ],
+  "schemas": [
+    { "group": "admin", "schema": ".*", "owner": true },
+    { "group": "analyst", "schema": "(silver|gold)", "owner": false },
+    { "group": "(executive|tenant)", "schema": "gold", "owner": false }
+  ],
+  "procedures": [
+    { "group": "admin", "catalog": ".*", "schema": ".*", "procedure": ".*", "privileges": ["EXECUTE"] }
+  ],
+  "tables": [
+    { "group": "admin", "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"] },
+    { "catalog": "system", "schema": "(metadata|information_schema|jdbc)", "privileges": ["SELECT"] },
+
+    {
+      "group": "tenant", "catalog": "delta", "schema": "gold",
+      "table": "(tenant_360|document_catalog|tenant_tickets|weighbridge_daily)",
+      "privileges": ["SELECT"],
+      "filter": "tenant_id = upper(regexp_extract(current_user, 'tenant_(.*)', 1))",
+      "columns": [
+        { "name": "pic_national_id", "mask": "concat(substr(pic_national_id, 1, 4), '************')" }
+      ]
+    },
+
+    {
+      "group": "executive", "catalog": "delta", "schema": "gold",
+      "privileges": ["SELECT"],
+      "columns": [
+        { "name": "pic_national_id", "mask": "concat(substr(pic_national_id, 1, 4), '************')" },
+        { "name": "pic_phone", "mask": "concat('********', substr(pic_phone, -3))" },
+        { "name": "pic_email", "mask": "regexp_replace(pic_email, '^(.).*(@.*)$', '$1***$2')" }
+      ]
+    },
+
+    {
+      "group": "analyst", "catalog": "delta", "schema": "(silver|gold)",
+      "privileges": ["SELECT"],
+      "columns": [
+        { "name": "pic_national_id", "mask": "'[REDACTED]'" },
+        { "name": "national_id", "mask": "'[REDACTED]'" },
+        { "name": "pic_phone", "mask": "concat('********', substr(pic_phone, -3))" },
+        { "name": "phone", "mask": "concat('********', substr(phone, -3))" },
+        { "name": "pic_email", "mask": "regexp_replace(pic_email, '^(.).*(@.*)$', '$1***$2')" },
+        { "name": "email", "mask": "regexp_replace(email, '^(.).*(@.*)$', '$1***$2')" },
+        { "name": "base_salary", "mask": "CAST(NULL AS BIGINT)" }
+      ]
+    }
+  ]
+}
